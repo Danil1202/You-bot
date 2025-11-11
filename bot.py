@@ -5,13 +5,12 @@ import logging
 import time
 import threading
 from collections import deque, defaultdict
-from datetime import datetime
 from http.server import HTTPServer, BaseHTTPRequestHandler
 
 import pandas as pd
 import pandas_ta as ta
 import websockets
-from telegram import Update, ReplyKeyboardMarkup
+from telegram import Update, ReplyKeyboardMarkup, Bot
 from telegram.ext import (
     ApplicationBuilder,
     CommandHandler,
@@ -183,6 +182,10 @@ async def check_signal(app, symbol, chat_id):
 
 # ----------------- Main -----------------
 def main():
+    # Удаляем старый webhook
+    bot = Bot(token=BOT_TOKEN)
+    bot.delete_webhook()
+
     app = ApplicationBuilder().token(BOT_TOKEN).build()
 
     # Команды
