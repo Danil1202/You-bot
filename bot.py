@@ -17,7 +17,7 @@ logger = logging.getLogger("binary_signal_bot")
 BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TWELVE_API_KEY = os.environ.get("TWELVE_API_KEY")
 PORT = int(os.environ.get("PORT", 8000))
-WEBHOOK_URL = f"https://you-bot-l2y9.onrender.com"  # замени на URL своего Render сервиса
+WEBHOOK_URL = f"https://you-bot-l2y9.onrender.com"  # замени на свой URL Render
 
 PAIRS = [
     "EUR/USD", "GBP/USD", "USD/JPY", "AUD/JPY", "EUR/GBP",
@@ -118,7 +118,7 @@ async def handle_time(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = f"🔔 Сигнал (по запросу)\nПара: {pair}\nНаправление: {direction}\n\n" + "\n".join(notes)
     await update.message.reply_text(msg)
 
-# ===== WebSocket обработка =====
+# ===== WebSocket =====
 async def ws_worker(app, chat_id):
     global auto_running
     url = f"wss://ws.twelvedata.com/v1/quotes?apikey={TWELVE_API_KEY}"
@@ -154,7 +154,7 @@ async def check_signal(app, symbol, chat_id):
 async def main():
     app = ApplicationBuilder().token(BOT_TOKEN).build()
 
-    # Удаляем старый webhook перед стартом
+    # Удаляем старый webhook
     bot = Bot(token=BOT_TOKEN)
     await bot.delete_webhook(drop_pending_updates=True)
 
@@ -164,15 +164,17 @@ async def main():
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_pair))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_time))
 
-    logger.info("Запуск webhook на Render")
-    await app.start()
+    await app.initialize()  # ✅ правильно инициализируем
+    await app.start()       # ✅ старт приложения
     await app.updater.start_webhook(
         listen="0.0.0.0",
         port=PORT,
         url_path=BOT_TOKEN,
         webhook_url=f"{WEBHOOK_URL}/{BOT_TOKEN}"
     )
-    await app.updater.idle()  # держит бота живым
+
+    logger.info("Webhook запущен")
+    await app.updater.idle()  # держим бота живым
 
 if __name__ == "__main__":
     asyncio.run(main())
