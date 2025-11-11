@@ -1,3 +1,18 @@
+from http.server import HTTPServer, BaseHTTPRequestHandler
+import os
+import threading
+
+# Простой сервер для Render
+class Handler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(b"Bot is running!")
+
+port = int(os.environ.get("PORT", 8000))
+server = HTTPServer(("0.0.0.0", port), Handler)
+threading.Thread(target=server.serve_forever, daemon=True).start()
+
 import os, asyncio, json, logging, time
 from datetime import datetime
 import pandas as pd, pandas_ta as ta
@@ -154,6 +169,7 @@ from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
 
 if __name__ == "__main__":
     asyncio.run(main())
+
 
 
 
