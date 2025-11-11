@@ -1,3 +1,4 @@
+import asyncio
 import os
 import json
 import logging
@@ -113,3 +114,4 @@ if __name__ == "__main__":
         url_path=BOT_TOKEN,
         webhook_url=f"{WEBHOOK_URL}/{BOT_TOKEN}"
     )
+
