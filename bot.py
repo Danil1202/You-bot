@@ -1,43 +1,32 @@
 import os
-import asyncio
 import json
+import asyncio
 import logging
 import time
-import threading
 from collections import deque, defaultdict
-from http.server import HTTPServer, BaseHTTPRequestHandler
+from datetime import datetime
 
 import pandas as pd
 import pandas_ta as ta
 import websockets
-from telegram import Update, ReplyKeyboardMarkup, Bot
+from telegram import ReplyKeyboardMarkup, Update, Bot
 from telegram.ext import (
     ApplicationBuilder,
     CommandHandler,
     MessageHandler,
-    filters,
     ContextTypes,
-    ConversationHandler,
+    filters,
 )
 
-# ----------------- HTTP сервер для Render -----------------
-class Handler(BaseHTTPRequestHandler):
-    def do_GET(self):
-        self.send_response(200)
-        self.end_headers()
-        self.wfile.write(b"Bot is running!")
-
-port = int(os.environ.get("PORT", 8000))
-server = HTTPServer(("0.0.0.0", port), Handler)
-threading.Thread(target=server.serve_forever, daemon=True).start()
-
-# ----------------- Логи -----------------
+# ===== ЛОГИ =====
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("binary_signal_bot")
 
-# ----------------- Конфиги -----------------
+# ===== ПЕРЕМЕННЫЕ =====
 BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TWELVE_API_KEY = os.environ.get("TWELVE_API_KEY")
+PORT = int(os.environ.get("PORT", 8000))
+WEBHOOK_URL = f"https://you-bot-l2y9.onrender.com"  # Замени на свой URL
 
 PAIRS = [
     "EUR/USD", "GBP/USD", "USD/JPY", "AUD/JPY", "EUR/GBP",
@@ -45,9 +34,8 @@ PAIRS = [
     "EUR/RUB", "USD/RUB"
 ]
 TIMES = ["5 сек", "15 сек", "30 сек", "1 мин", "5 мин", "10 мин"]
-
-PAIR_BUTTONS = [PAIRS[i:i+3] for i in range(0, len(PAIRS), 3)]
 TIME_BUTTONS = [TIMES[i:i+3] for i in range(0, len(TIMES), 3)]
+PAIR_BUTTONS = [PAIRS[i:i+3] for i in range(0, len(PAIRS), 3)]
 
 user_state = {}
 auto_running = False
@@ -57,9 +45,7 @@ last_sent = {}
 SIGNAL_THRESHOLD = 0.3
 COOLDOWN = 30
 
-STEP_PAIR, STEP_TIME = range(2)
-
-# ----------------- Функции анализа -----------------
+# ===== АНАЛИЗ =====
 def compute_score(series):
     if len(series) < 10:
         return 0, ["мало данных"]
@@ -69,14 +55,12 @@ def compute_score(series):
     df["rsi"] = ta.rsi(df["close"], length=14)
     score = 0
     notes = []
-
     if df["ema5"].iloc[-1] > df["ema12"].iloc[-1]:
         score += 0.5
         notes.append("EMA5 > EMA12")
     else:
         score -= 0.5
         notes.append("EMA5 < EMA12")
-
     r = df["rsi"].iloc[-1]
     notes.append(f"RSI={r:.1f}")
     if r > 70:
@@ -85,14 +69,12 @@ def compute_score(series):
     elif r < 30:
         score += 0.3
         notes.append("RSI перепродан")
-
     return score, notes
 
-# ----------------- Telegram команды -----------------
+# ===== КОМАНДЫ TELEGRAM =====
 async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     kb = ReplyKeyboardMarkup(PAIR_BUTTONS, resize_keyboard=True)
     await update.message.reply_text("👋 Привет! Выбери валютную пару:", reply_markup=kb)
-    return STEP_PAIR
 
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("/start - начать\n/auto on|off - включить/выключить автоанализ")
@@ -120,40 +102,32 @@ async def auto_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         await update.message.reply_text("Используй /auto on или /auto off")
 
-# ----------------- ConversationHandler -----------------
 async def handle_pair(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text.strip()
     if text not in PAIRS:
-        await update.message.reply_text("Выбери валютную пару с кнопок.")
-        return STEP_PAIR
+        return
     user_state[update.effective_chat.id] = text
     kb = ReplyKeyboardMarkup(TIME_BUTTONS, resize_keyboard=True)
     await update.message.reply_text(f"Пара: {text}\nВыбери время:", reply_markup=kb)
-    return STEP_TIME
 
 async def handle_time(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text.strip()
     if text not in TIMES:
-        await update.message.reply_text("Выбери время с кнопок.")
-        return STEP_TIME
-
+        return
     pair = user_state.get(update.effective_chat.id)
     if not pair:
         await update.message.reply_text("Сначала выбери пару.")
-        return STEP_PAIR
-
+        return
     data = [p for (_, p) in prices[pair]]
     if not data:
         await update.message.reply_text("Нет данных, включи /auto on")
-        return ConversationHandler.END
-
+        return
     score, notes = compute_score(data)
     direction = "🟩 Вверх" if score > 0 else "🟥 Вниз" if score < 0 else "⬜ Нейтрально"
     msg = f"🔔 Сигнал (по запросу)\nПара: {pair}\nНаправление: {direction}\n\n" + "\n".join(notes)
     await update.message.reply_text(msg)
-    return ConversationHandler.END
 
-# ----------------- WebSocket -----------------
+# ===== WEBSOCKET =====
 async def ws_worker(app, chat_id):
     global auto_running
     url = f"wss://ws.twelvedata.com/v1/quotes?apikey={TWELVE_API_KEY}"
@@ -180,32 +154,30 @@ async def check_signal(app, symbol, chat_id):
         await app.bot.send_message(chat_id=chat_id, text=msg)
         last_sent[symbol] = now
 
-# ----------------- Main -----------------
-def main():
-    # Удаляем старый webhook
-    bot = Bot(token=BOT_TOKEN)
-    bot.delete_webhook()
-
+# ===== MAIN =====
+async def main():
     app = ApplicationBuilder().token(BOT_TOKEN).build()
 
-    # Команды
+    # Удаляем старые webhook
+    bot = Bot(token=BOT_TOKEN)
+    await bot.delete_webhook(drop_pending_updates=True)
+
+    # Добавляем обработчики
+    app.add_handler(CommandHandler("start", start_cmd))
     app.add_handler(CommandHandler("help", help_cmd))
     app.add_handler(CommandHandler("auto", auto_cmd))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_pair))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_time))
 
-    # Conversation для выбора пары и времени
-    conv_handler = ConversationHandler(
-        entry_points=[CommandHandler("start", start_cmd)],
-        states={
-            STEP_PAIR: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_pair)],
-            STEP_TIME: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_time)],
-        },
-        fallbacks=[],
+    logger.info("Bot запущен на webhook")
+
+    # Запуск webhook
+    await app.run_webhook(
+        listen="0.0.0.0",
+        port=PORT,
+        url_path=BOT_TOKEN,
+        webhook_url=f"{WEBHOOK_URL}/{BOT_TOKEN}"
     )
-    app.add_handler(conv_handler)
 
-    logger.info("Bot запущен")
-    app.run_polling()
-
-# ----------------- Запуск -----------------
 if __name__ == "__main__":
     asyncio.run(main())
