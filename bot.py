@@ -1,24 +1,27 @@
 import os
 import asyncio
-import json
 import logging
+import json
 import time
-from collections import deque, defaultdict
+from collections import defaultdict, deque
 from datetime import datetime
-from http.server import HTTPServer, BaseHTTPRequestHandler
-import threading
 
 import pandas as pd
 import pandas_ta as ta
 import websockets
 from telegram import ReplyKeyboardMarkup, Update
-from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, ContextTypes, filters
+from telegram.ext import (
+    ApplicationBuilder,
+    CommandHandler,
+    MessageHandler,
+    filters,
+    ContextTypes,
+    Bot,
+)
 
-# === Логирование ===
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("binary_signal_bot")
 
-# === Настройки ===
 BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TWELVE_API_KEY = os.environ.get("TWELVE_API_KEY")
 
@@ -39,18 +42,7 @@ last_sent = {}
 SIGNAL_THRESHOLD = 0.3
 COOLDOWN = 30
 
-# === Простой сервер для Render ===
-class Handler(BaseHTTPRequestHandler):
-    def do_GET(self):
-        self.send_response(200)
-        self.end_headers()
-        self.wfile.write(b"Bot is running!")
-
-port = int(os.environ.get("PORT", 8000))
-server = HTTPServer(("0.0.0.0", port), Handler)
-threading.Thread(target=server.serve_forever, daemon=True).start()
-
-# === Анализ индикаторов ===
+# --- Анализ индикаторов ---
 def compute_score(series):
     if len(series) < 10:
         return 0, ["мало данных"]
@@ -58,6 +50,7 @@ def compute_score(series):
     df["ema5"] = ta.ema(df["close"], length=5)
     df["ema12"] = ta.ema(df["close"], length=12)
     df["rsi"] = ta.rsi(df["close"], length=14)
+
     score = 0
     notes = []
 
@@ -78,7 +71,7 @@ def compute_score(series):
         notes.append("RSI перепродан")
     return score, notes
 
-# === Telegram команды ===
+# --- Telegram команды ---
 async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     kb = ReplyKeyboardMarkup(PAIR_BUTTONS, resize_keyboard=True)
     await update.message.reply_text("👋 Привет! Выбери валютную пару:", reply_markup=kb)
@@ -134,7 +127,7 @@ async def handle_time(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = f"🔔 Сигнал (по запросу)\nПара: {pair}\nНаправление: {direction}\n\n" + "\n".join(notes)
     await update.message.reply_text(msg)
 
-# === WebSocket обработка ===
+# --- WebSocket обработка ---
 async def ws_worker(app, chat_id):
     global auto_running
     url = f"wss://ws.twelvedata.com/v1/quotes?apikey={TWELVE_API_KEY}"
@@ -165,11 +158,17 @@ async def check_signal(app, symbol, chat_id):
         await app.bot.send_message(chat_id=chat_id, text=msg)
         last_sent[symbol] = now
 
-# === Главная функция ===
+# --- Удаление webhook перед стартом ---
+async def clear_webhook():
+    bot = Bot(token=BOT_TOKEN)
+    await bot.delete_webhook(drop_pending_updates=True)
+    logger.info("Webhook удалён, очередь сброшена")
+
+# --- Основной запуск ---
 async def main():
+    await clear_webhook()
     app = ApplicationBuilder().token(BOT_TOKEN).build()
 
-    # Добавляем хэндлеры
     app.add_handler(CommandHandler("start", start_cmd))
     app.add_handler(CommandHandler("help", help_cmd))
     app.add_handler(CommandHandler("auto", auto_cmd))
@@ -177,16 +176,10 @@ async def main():
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_time))
 
     logger.info("Bot запущен")
-    
     await app.initialize()
     await app.start()
-    
-    # Запускаем polling
     await app.updater.start_polling()
-    
-    # "Вечный" цикл для Render
-    await asyncio.Event().wait()
+    await app.updater.idle()  # держим процесс живым
 
-# === Точка входа ===
 if __name__ == "__main__":
     asyncio.run(main())
