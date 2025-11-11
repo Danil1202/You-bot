@@ -142,25 +142,19 @@ def main():
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_time))
     logger.info("Bot запущен")
     app.run_polling()
-    import threading
-from http.server import BaseHTTPRequestHandler, HTTPServer
+    # Стандартные библиотеки
+import os
+import asyncio
+import threading  # для запуска сервера в отдельном потоке
+from http.server import HTTPServer, BaseHTTPRequestHandler  # если нужен простой HTTP сервер
 
-class KeepAlive(BaseHTTPRequestHandler):
-    def do_GET(self):
-        self.send_response(200)
-        self.end_headers()
-        self.wfile.write(b"OK")
-
-def start_server():
-    port = int(os.environ.get("PORT", 10000))
-    server = HTTPServer(("0.0.0.0", port), KeepAlive)
-    threading.Thread(target=server.serve_forever, daemon=True).start()
-    print(f"KeepAlive server running on port {port}")
-
-start_server()
+# Библиотеки для Telegram
+from telegram import Update, ReplyKeyboardMarkup
+from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
 
 if __name__ == "__main__":
     asyncio.run(main())
+
 
 
 
