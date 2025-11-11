@@ -3,32 +3,35 @@ import asyncio
 import json
 import logging
 import time
-import threading
 from collections import deque, defaultdict
-from http.server import HTTPServer, BaseHTTPRequestHandler
 
 import pandas as pd
 import pandas_ta as ta
 import websockets
-from telegram import Update, ReplyKeyboardMarkup
-from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, ContextTypes, filters
+from telegram import ReplyKeyboardMarkup, Update
+from telegram.ext import (
+    ApplicationBuilder, CommandHandler, MessageHandler,
+    ContextTypes, filters
+)
 
-# ================= Логи =================
+# === Логирование ===
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("binary_signal_bot")
 
-# ================= Константы =================
+# === Токены и API ===
 BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TWELVE_API_KEY = os.environ.get("TWELVE_API_KEY")
 
+# === Настройки бота ===
 PAIRS = [
     "EUR/USD", "GBP/USD", "USD/JPY", "AUD/JPY", "EUR/GBP",
     "EUR/JPY", "GBP/JPY", "USD/CHF", "AUD/USD", "NZD/USD",
     "EUR/RUB", "USD/RUB"
 ]
 TIMES = ["5 сек", "15 сек", "30 сек", "1 мин", "5 мин", "10 мин"]
-TIME_BUTTONS = [TIMES[i:i+3] for i in range(0, len(TIMES), 3)]
+
 PAIR_BUTTONS = [PAIRS[i:i+3] for i in range(0, len(PAIRS), 3)]
+TIME_BUTTONS = [TIMES[i:i+3] for i in range(0, len(TIMES), 3)]
 
 user_state = {}
 auto_running = False
@@ -38,18 +41,7 @@ last_sent = {}
 SIGNAL_THRESHOLD = 0.3
 COOLDOWN = 30
 
-# ================= Сервер для Render =================
-class Handler(BaseHTTPRequestHandler):
-    def do_GET(self):
-        self.send_response(200)
-        self.end_headers()
-        self.wfile.write(b"Bot is running!")
-
-port = int(os.environ.get("PORT", 8000))
-server = HTTPServer(("0.0.0.0", port), Handler)
-threading.Thread(target=server.serve_forever, daemon=True).start()
-
-# ================= Анализ =================
+# === Анализ индикаторов ===
 def compute_score(series):
     if len(series) < 10:
         return 0, ["мало данных"]
@@ -57,20 +49,28 @@ def compute_score(series):
     df["ema5"] = ta.ema(df["close"], length=5)
     df["ema12"] = ta.ema(df["close"], length=12)
     df["rsi"] = ta.rsi(df["close"], length=14)
-    score = 0; notes = []
+    score = 0
+    notes = []
+
     if df["ema5"].iloc[-1] > df["ema12"].iloc[-1]:
-        score += 0.5; notes.append("EMA5 > EMA12")
+        score += 0.5
+        notes.append("EMA5 > EMA12")
     else:
-        score -= 0.5; notes.append("EMA5 < EMA12")
+        score -= 0.5
+        notes.append("EMA5 < EMA12")
+
     r = df["rsi"].iloc[-1]
     notes.append(f"RSI={r:.1f}")
     if r > 70:
-        score -= 0.3; notes.append("RSI перекуплен")
+        score -= 0.3
+        notes.append("RSI перекуплен")
     elif r < 30:
-        score += 0.3; notes.append("RSI перепродан")
+        score += 0.3
+        notes.append("RSI перепродан")
+
     return score, notes
 
-# ================= Команды =================
+# === Telegram команды ===
 async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     kb = ReplyKeyboardMarkup(PAIR_BUTTONS, resize_keyboard=True)
     await update.message.reply_text("👋 Привет! Выбери валютную пару:", reply_markup=kb)
@@ -84,6 +84,7 @@ async def auto_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
         await update.message.reply_text("Используй /auto on или /auto off")
         return
+
     arg = context.args[0].lower()
     if arg == "on":
         if auto_running:
@@ -101,54 +102,55 @@ async def auto_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         await update.message.reply_text("Используй /auto on или /auto off")
 
-# ================= Обработка пользовательского ввода =================
-async def handle_user_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    chat_id = update.effective_chat.id
+async def handle_pair(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text.strip()
-
-    # Если пара не выбрана
-    if chat_id not in user_state:
-        if text in PAIRS:
-            user_state[chat_id] = {"pair": text}
-            kb = ReplyKeyboardMarkup(TIME_BUTTONS, resize_keyboard=True)
-            await update.message.reply_text(f"Пара: {text}\nВыбери время:", reply_markup=kb)
-        else:
-            await update.message.reply_text("Выбери валютную пару:")
+    if text not in PAIRS:
         return
+    user_state[update.effective_chat.id] = text
+    kb = ReplyKeyboardMarkup(TIME_BUTTONS, resize_keyboard=True)
+    await update.message.reply_text(f"Пара: {text}\nВыбери время:", reply_markup=kb)
 
-    # Если пара выбрана, выбираем время
-    if "pair" in user_state[chat_id] and "time" not in user_state[chat_id]:
-        if text in TIMES:
-            user_state[chat_id]["time"] = text
-            pair = user_state[chat_id]["pair"]
-            data = [p for (_, p) in prices[pair]]
-            if not data:
-                await update.message.reply_text("Нет данных, включи /auto on")
-                return
-            score, notes = compute_score(data)
-            direction = "🟩 Вверх" if score > 0 else "🟥 Вниз" if score < 0 else "⬜ Нейтрально"
-            msg = f"🔔 Сигнал (по запросу)\nПара: {pair}\nНаправление: {direction}\n\n" + "\n".join(notes)
-            await update.message.reply_text(msg)
-        else:
-            await update.message.reply_text("Выбери время из кнопок")
+async def handle_time(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text.strip()
+    if text not in TIMES:
+        return
+    pair = user_state.get(update.effective_chat.id)
+    if not pair:
+        await update.message.reply_text("Сначала выбери пару.")
+        return
+    data = [p for (_, p) in prices[pair]]
+    if not data:
+        await update.message.reply_text("Нет данных, включи /auto on")
+        return
+    score, notes = compute_score(data)
+    direction = "🟩 Вверх" if score > 0 else "🟥 Вниз" if score < 0 else "⬜ Нейтрально"
+    msg = f"🔔 Сигнал (по запросу)\nПара: {pair}\nНаправление: {direction}\n\n" + "\n".join(notes)
+    await update.message.reply_text(msg)
 
-# ================= WebSocket =================
+# === WebSocket обработка ===
 async def ws_worker(app, chat_id):
     global auto_running
-    url = f"wss://ws.twelvedata.com/v1/quotes?apikey={TWELVE_API_KEY}"
+    symbols = ",".join(PAIRS)
+    url = f"wss://ws.twelvedata.com/v1/quotes?symbols={symbols}&apikey={TWELVE_API_KEY}"
+
     try:
         async with websockets.connect(url) as ws:
-            await ws.send(json.dumps({"action": "subscribe", "params": {"symbols": ",".join(PAIRS)}}))
+            logger.info("WS подключён")
             while auto_running:
-                msg = await ws.recv()
-                data = json.loads(msg)
-                logger.info(f"WS update: {data}")  # Лог для отладки
-                if "symbol" in data and "price" in data:
-                    s, p = data["symbol"], float(data["price"])
-                    prices[s].append((time.time(), p))
-                    await check_signal(app, s, chat_id)
+                try:
+                    msg = await ws.recv()
+                    data = json.loads(msg)
+                    logger.info(f"WS update: {data}")
+
+                    if "symbol" in data and "price" in data:
+                        symbol, price = data["symbol"], float(data["price"])
+                        prices[symbol].append((time.time(), price))
+                        await check_signal(app, symbol, chat_id)
+                except Exception as e:
+                    logger.error(f"WS error during recv: {e}")
+                    await asyncio.sleep(1)
     except Exception as e:
-        logger.error(f"WS error: {e}")
+        logger.error(f"WS connection error: {e}")
     finally:
         logger.info("WS закрыт")
 
@@ -164,18 +166,21 @@ async def check_signal(app, symbol, chat_id):
         await app.bot.send_message(chat_id=chat_id, text=msg)
         last_sent[symbol] = now
 
-# ================= Main =================
+# === Главная функция ===
 async def main():
     app = ApplicationBuilder().token(BOT_TOKEN).build()
+
     app.add_handler(CommandHandler("start", start_cmd))
     app.add_handler(CommandHandler("help", help_cmd))
     app.add_handler(CommandHandler("auto", auto_cmd))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_user_input))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_pair))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_time))
+
     logger.info("Bot запущен")
     await app.initialize()
     await app.start()
-    await app.updater.start_polling()  # Polling вместо webhook на Render
-    await asyncio.Event().wait()  # держим бота живым
+    await app.updater.start_polling()
+    await app.updater.idle()
 
 if __name__ == "__main__":
     asyncio.run(main())
