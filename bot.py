@@ -4,34 +4,32 @@ import json
 import logging
 import time
 from collections import deque, defaultdict
+from datetime import datetime
+from http.server import HTTPServer, BaseHTTPRequestHandler
+import threading
 
 import pandas as pd
 import pandas_ta as ta
 import websockets
 from telegram import ReplyKeyboardMarkup, Update
-from telegram.ext import (
-    ApplicationBuilder, CommandHandler, MessageHandler,
-    ContextTypes, filters
-)
+from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, ContextTypes, filters
 
 # === Логирование ===
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("binary_signal_bot")
 
-# === Токены и API ===
+# === Настройки ===
 BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TWELVE_API_KEY = os.environ.get("TWELVE_API_KEY")
 
-# === Настройки бота ===
 PAIRS = [
     "EUR/USD", "GBP/USD", "USD/JPY", "AUD/JPY", "EUR/GBP",
     "EUR/JPY", "GBP/JPY", "USD/CHF", "AUD/USD", "NZD/USD",
     "EUR/RUB", "USD/RUB"
 ]
 TIMES = ["5 сек", "15 сек", "30 сек", "1 мин", "5 мин", "10 мин"]
-
-PAIR_BUTTONS = [PAIRS[i:i+3] for i in range(0, len(PAIRS), 3)]
 TIME_BUTTONS = [TIMES[i:i+3] for i in range(0, len(TIMES), 3)]
+PAIR_BUTTONS = [PAIRS[i:i+3] for i in range(0, len(PAIRS), 3)]
 
 user_state = {}
 auto_running = False
@@ -40,6 +38,17 @@ prices = defaultdict(lambda: deque(maxlen=120))
 last_sent = {}
 SIGNAL_THRESHOLD = 0.3
 COOLDOWN = 30
+
+# === Простой сервер для Render ===
+class Handler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(b"Bot is running!")
+
+port = int(os.environ.get("PORT", 8000))
+server = HTTPServer(("0.0.0.0", port), Handler)
+threading.Thread(target=server.serve_forever, daemon=True).start()
 
 # === Анализ индикаторов ===
 def compute_score(series):
@@ -67,7 +76,6 @@ def compute_score(series):
     elif r < 30:
         score += 0.3
         notes.append("RSI перепродан")
-
     return score, notes
 
 # === Telegram команды ===
@@ -84,7 +92,6 @@ async def auto_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
         await update.message.reply_text("Используй /auto on или /auto off")
         return
-
     arg = context.args[0].lower()
     if arg == "on":
         if auto_running:
@@ -130,27 +137,19 @@ async def handle_time(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # === WebSocket обработка ===
 async def ws_worker(app, chat_id):
     global auto_running
-    symbols = ",".join(PAIRS)
-    url = f"wss://ws.twelvedata.com/v1/quotes?symbols={symbols}&apikey={TWELVE_API_KEY}"
-
+    url = f"wss://ws.twelvedata.com/v1/quotes?apikey={TWELVE_API_KEY}"
     try:
         async with websockets.connect(url) as ws:
-            logger.info("WS подключён")
+            await ws.send(json.dumps({"action": "subscribe", "params": {"symbols": ",".join(PAIRS)}}))
             while auto_running:
-                try:
-                    msg = await ws.recv()
-                    data = json.loads(msg)
-                    logger.info(f"WS update: {data}")
-
-                    if "symbol" in data and "price" in data:
-                        symbol, price = data["symbol"], float(data["price"])
-                        prices[symbol].append((time.time(), price))
-                        await check_signal(app, symbol, chat_id)
-                except Exception as e:
-                    logger.error(f"WS error during recv: {e}")
-                    await asyncio.sleep(1)
+                msg = await ws.recv()
+                data = json.loads(msg)
+                if "symbol" in data and "price" in data:
+                    s, p = data["symbol"], float(data["price"])
+                    prices[s].append((time.time(), p))
+                    await check_signal(app, s, chat_id)
     except Exception as e:
-        logger.error(f"WS connection error: {e}")
+        logger.error(f"WS error: {e}")
     finally:
         logger.info("WS закрыт")
 
@@ -170,6 +169,7 @@ async def check_signal(app, symbol, chat_id):
 async def main():
     app = ApplicationBuilder().token(BOT_TOKEN).build()
 
+    # Добавляем хэндлеры
     app.add_handler(CommandHandler("start", start_cmd))
     app.add_handler(CommandHandler("help", help_cmd))
     app.add_handler(CommandHandler("auto", auto_cmd))
@@ -177,10 +177,16 @@ async def main():
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_time))
 
     logger.info("Bot запущен")
+    
     await app.initialize()
     await app.start()
+    
+    # Запускаем polling
     await app.updater.start_polling()
-    await app.updater.idle()
+    
+    # "Вечный" цикл для Render
+    await asyncio.Event().wait()
 
+# === Точка входа ===
 if __name__ == "__main__":
     asyncio.run(main())
