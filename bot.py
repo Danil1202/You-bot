@@ -1,8 +1,27 @@
-from http.server import HTTPServer, BaseHTTPRequestHandler
 import os
+import asyncio
+import json
+import logging
+import time
 import threading
+from collections import deque, defaultdict
+from datetime import datetime
+from http.server import HTTPServer, BaseHTTPRequestHandler
 
-# Простой сервер для Render
+import pandas as pd
+import pandas_ta as ta
+import websockets
+from telegram import Update, ReplyKeyboardMarkup
+from telegram.ext import (
+    ApplicationBuilder,
+    CommandHandler,
+    MessageHandler,
+    filters,
+    ContextTypes,
+    ConversationHandler,
+)
+
+# ----------------- HTTP сервер для Render -----------------
 class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
@@ -13,17 +32,11 @@ port = int(os.environ.get("PORT", 8000))
 server = HTTPServer(("0.0.0.0", port), Handler)
 threading.Thread(target=server.serve_forever, daemon=True).start()
 
-import os, asyncio, json, logging, time
-from datetime import datetime
-import pandas as pd, pandas_ta as ta
-from telegram import ReplyKeyboardMarkup, Update
-from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters, ContextTypes
-import websockets
-from collections import deque, defaultdict
-
+# ----------------- Логи -----------------
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("binary_signal_bot")
 
+# ----------------- Конфиги -----------------
 BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN")
 TWELVE_API_KEY = os.environ.get("TWELVE_API_KEY")
 
@@ -33,8 +46,9 @@ PAIRS = [
     "EUR/RUB", "USD/RUB"
 ]
 TIMES = ["5 сек", "15 сек", "30 сек", "1 мин", "5 мин", "10 мин"]
-TIME_BUTTONS = [TIMES[i:i+3] for i in range(0, len(TIMES), 3)]
+
 PAIR_BUTTONS = [PAIRS[i:i+3] for i in range(0, len(PAIRS), 3)]
+TIME_BUTTONS = [TIMES[i:i+3] for i in range(0, len(TIMES), 3)]
 
 user_state = {}
 auto_running = False
@@ -44,7 +58,9 @@ last_sent = {}
 SIGNAL_THRESHOLD = 0.3
 COOLDOWN = 30
 
-# === Анализ индикаторов ===
+STEP_PAIR, STEP_TIME = range(2)
+
+# ----------------- Функции анализа -----------------
 def compute_score(series):
     if len(series) < 10:
         return 0, ["мало данных"]
@@ -52,23 +68,32 @@ def compute_score(series):
     df["ema5"] = ta.ema(df["close"], length=5)
     df["ema12"] = ta.ema(df["close"], length=12)
     df["rsi"] = ta.rsi(df["close"], length=14)
-    score = 0; notes = []
+    score = 0
+    notes = []
+
     if df["ema5"].iloc[-1] > df["ema12"].iloc[-1]:
-        score += 0.5; notes.append("EMA5 > EMA12")
+        score += 0.5
+        notes.append("EMA5 > EMA12")
     else:
-        score -= 0.5; notes.append("EMA5 < EMA12")
+        score -= 0.5
+        notes.append("EMA5 < EMA12")
+
     r = df["rsi"].iloc[-1]
     notes.append(f"RSI={r:.1f}")
     if r > 70:
-        score -= 0.3; notes.append("RSI перекуплен")
+        score -= 0.3
+        notes.append("RSI перекуплен")
     elif r < 30:
-        score += 0.3; notes.append("RSI перепродан")
+        score += 0.3
+        notes.append("RSI перепродан")
+
     return score, notes
 
-# === Telegram команды ===
+# ----------------- Telegram команды -----------------
 async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     kb = ReplyKeyboardMarkup(PAIR_BUTTONS, resize_keyboard=True)
     await update.message.reply_text("👋 Привет! Выбери валютную пару:", reply_markup=kb)
+    return STEP_PAIR
 
 async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("/start - начать\n/auto on|off - включить/выключить автоанализ")
@@ -96,32 +121,40 @@ async def auto_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         await update.message.reply_text("Используй /auto on или /auto off")
 
+# ----------------- ConversationHandler -----------------
 async def handle_pair(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text.strip()
     if text not in PAIRS:
-        return
+        await update.message.reply_text("Выбери валютную пару с кнопок.")
+        return STEP_PAIR
     user_state[update.effective_chat.id] = text
     kb = ReplyKeyboardMarkup(TIME_BUTTONS, resize_keyboard=True)
     await update.message.reply_text(f"Пара: {text}\nВыбери время:", reply_markup=kb)
+    return STEP_TIME
 
 async def handle_time(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text.strip()
     if text not in TIMES:
-        return
+        await update.message.reply_text("Выбери время с кнопок.")
+        return STEP_TIME
+
     pair = user_state.get(update.effective_chat.id)
     if not pair:
         await update.message.reply_text("Сначала выбери пару.")
-        return
+        return STEP_PAIR
+
     data = [p for (_, p) in prices[pair]]
     if not data:
         await update.message.reply_text("Нет данных, включи /auto on")
-        return
+        return ConversationHandler.END
+
     score, notes = compute_score(data)
     direction = "🟩 Вверх" if score > 0 else "🟥 Вниз" if score < 0 else "⬜ Нейтрально"
     msg = f"🔔 Сигнал (по запросу)\nПара: {pair}\nНаправление: {direction}\n\n" + "\n".join(notes)
     await update.message.reply_text(msg)
+    return ConversationHandler.END
 
-# === WebSocket обработка ===
+# ----------------- WebSocket -----------------
 async def ws_worker(app, chat_id):
     global auto_running
     url = f"wss://ws.twelvedata.com/v1/quotes?apikey={TWELVE_API_KEY}"
@@ -148,29 +181,28 @@ async def check_signal(app, symbol, chat_id):
         await app.bot.send_message(chat_id=chat_id, text=msg)
         last_sent[symbol] = now
 
+# ----------------- Main -----------------
 def main():
     app = ApplicationBuilder().token(BOT_TOKEN).build()
-    app.add_handler(CommandHandler("start", start_cmd))
+
+    # Команды
     app.add_handler(CommandHandler("help", help_cmd))
     app.add_handler(CommandHandler("auto", auto_cmd))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_pair))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_time))
+
+    # Conversation для выбора пары и времени
+    conv_handler = ConversationHandler(
+        entry_points=[CommandHandler("start", start_cmd)],
+        states={
+            STEP_PAIR: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_pair)],
+            STEP_TIME: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_time)],
+        },
+        fallbacks=[],
+    )
+    app.add_handler(conv_handler)
+
     logger.info("Bot запущен")
     app.run_polling()
-    # Стандартные библиотеки
-import os
-import asyncio
-import threading  # для запуска сервера в отдельном потоке
-from http.server import HTTPServer, BaseHTTPRequestHandler  # если нужен простой HTTP сервер
 
-# Библиотеки для Telegram
-from telegram import Update, ReplyKeyboardMarkup
-from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
-
+# ----------------- Запуск -----------------
 if __name__ == "__main__":
     asyncio.run(main())
-
-
-
-
-
